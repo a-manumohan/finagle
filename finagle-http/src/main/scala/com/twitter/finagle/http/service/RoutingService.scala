@@ -1,10 +1,9 @@
 package com.twitter.finagle.http.service
 
 import com.twitter.finagle.Service
-import com.twitter.finagle.http.{Status, Request, Response}
+import com.twitter.finagle.http.{Request, Response, Method}
 import com.twitter.finagle.http.path.Path
 import com.twitter.util.Future
-
 
 /**
  * RoutingService for composing Services.  Responds with 404 Not Found if no
@@ -47,4 +46,18 @@ object RoutingService {
        def apply(request: Request)       = routes(Path(request.path))
        def isDefinedAt(request: Request) = routes.isDefinedAt(Path(request.path))
      })
+
+  def byMethodAndPath[REQUEST](routes: PartialFunction[(Method, String), Service[REQUEST, Response]]) =
+    new RoutingService(
+      new PartialFunction[Request, Service[REQUEST, Response]] {
+        def apply(request: Request) = routes((request.method, request.path))
+        def isDefinedAt(request: Request) = routes.isDefinedAt((request.method, request.path))
+      })
+
+  def byMethodAndPathObject[REQUEST](routes: PartialFunction[(Method, Path), Service[REQUEST, Response]]) =
+    new RoutingService(
+      new PartialFunction[Request, Service[REQUEST, Response]] {
+        def apply(request: Request) = routes((request.method, Path(request.path)))
+        def isDefinedAt(request: Request) = routes.isDefinedAt((request.method, Path(request.path)))
+      })
 }

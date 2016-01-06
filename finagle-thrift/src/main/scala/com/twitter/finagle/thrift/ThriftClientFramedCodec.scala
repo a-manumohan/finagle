@@ -1,17 +1,11 @@
 package com.twitter.finagle.thrift
 
 import com.twitter.finagle._
-import com.twitter.finagle.tracing.{Trace, Annotation}
-import com.twitter.finagle.util.Conversions._
-import com.twitter.finagle.util.{ByteArrays, Ok, Error, Cancelled}
-import com.twitter.util.{Future, Time}
-import org.apache.thrift.protocol.{
-  TBinaryProtocol, TMessage, TMessageType, TProtocol, TProtocolFactory}
+import com.twitter.util.Future
+import org.apache.thrift.protocol.{TBinaryProtocol, TMessage, TMessageType, TProtocolFactory}
 import org.apache.thrift.transport.TMemoryInputTransport
 import org.jboss.netty.buffer.ChannelBuffers
-import org.jboss.netty.channel.{
-  ChannelHandlerContext, ChannelPipelineFactory, Channels, MessageEvent,
-  SimpleChannelDownstreamHandler}
+import org.jboss.netty.channel._
 
 /**
  * ThriftClientFramedCodec implements a framed thrift transport that
@@ -24,27 +18,38 @@ object ThriftClientFramedCodec {
    * Passing a ClientId will propagate that information to the server iff the server is a finagle
    * server.
    */
-  def apply(clientId: Option[ClientId] = None) = new ThriftClientFramedCodecFactory(clientId)
+  def apply(clientId: Option[ClientId] = None) =
+    new ThriftClientFramedCodecFactory(clientId)
 
   def get() = apply()
 }
 
-class ThriftClientFramedCodecFactory(clientId: Option[ClientId], _useCallerSeqIds: Boolean)
-  extends CodecFactory[ThriftClientRequest, Array[Byte]]#Client
-{
-  def this(clientId: Option[ClientId]) = this(clientId, false)
+class ThriftClientFramedCodecFactory(
+    clientId: Option[ClientId],
+    _useCallerSeqIds: Boolean,
+    _protocolFactory: TProtocolFactory)
+  extends CodecFactory[ThriftClientRequest, Array[Byte]]#Client {
+
+  def this(clientId: Option[ClientId]) = this(clientId, false, Protocols.binaryFactory())
+
+  def this(clientId: ClientId) = this(Some(clientId))
 
   // Fix this after the API/ABI freeze (use case class builder)
   def useCallerSeqIds(x: Boolean): ThriftClientFramedCodecFactory =
-    new ThriftClientFramedCodecFactory(clientId, x)
+    new ThriftClientFramedCodecFactory(clientId, x, _protocolFactory)
+
+  /**
+   * Use the given protocolFactory in stead of the default `TBinaryProtocol.Factory`
+   */
+  def protocolFactory(pf: TProtocolFactory) =
+    new ThriftClientFramedCodecFactory(clientId, _useCallerSeqIds, pf)
 
   /**
    * Create a [[com.twitter.finagle.thrift.ThriftClientFramedCodec]]
    * with a default TBinaryProtocol.
    */
   def apply(config: ClientCodecConfig) =
-    new ThriftClientFramedCodec(new TBinaryProtocol.Factory(), config, clientId, _useCallerSeqIds)
-
+    new ThriftClientFramedCodec(_protocolFactory, config, clientId, _useCallerSeqIds)
 }
 
 class ThriftClientFramedCodec(
@@ -52,45 +57,22 @@ class ThriftClientFramedCodec(
   config: ClientCodecConfig,
   clientId: Option[ClientId] = None,
   useCallerSeqIds: Boolean = false
-) extends Codec[ThriftClientRequest, Array[Byte]]
-{
-  def pipelineFactory =
-    new ChannelPipelineFactory {
-      def getPipeline() = {
-        val pipeline = Channels.pipeline()
-        pipeline.addLast("thriftFrameCodec", new ThriftFrameCodec)
-        pipeline.addLast("byteEncoder",      new ThriftClientChannelBufferEncoder)
-        pipeline.addLast("byteDecoder",      new ThriftChannelBufferDecoder)
-        pipeline
-      }
-    }
+) extends Codec[ThriftClientRequest, Array[Byte]] {
 
-  override def prepareConnFactory(underlying: ServiceFactory[ThriftClientRequest, Array[Byte]]) =
-    underlying flatMap { service =>
-      // Attempt to upgrade the protocol the first time around by
-      // sending a magic method invocation.
-      val buffer = new OutputBuffer()
-      buffer().writeMessageBegin(new TMessage(ThriftTracing.CanTraceMethodName, TMessageType.CALL, 0))
+  private[this] val preparer = ThriftClientPreparer(
+    protocolFactory, config.serviceName,
+    clientId, useCallerSeqIds)
 
-      val options = new thrift.ConnectionOptions
-      options.write(buffer())
+  def pipelineFactory: ChannelPipelineFactory =
+    ThriftClientFramedPipelineFactory
 
-      buffer().writeMessageEnd()
+  override def prepareConnFactory(
+    underlying: ServiceFactory[ThriftClientRequest, Array[Byte]]
+  ) = preparer.prepare(underlying)
 
-      service(new ThriftClientRequest(buffer.toArray, false)) map { bytes =>
-        val memoryTransport = new TMemoryInputTransport(bytes)
-        val iprot = protocolFactory.getProtocol(memoryTransport)
-        val reply = iprot.readMessageBegin()
-        val tracingFilter = new ThriftClientTracingFilter(
-          config.serviceName,
-          reply.`type` != TMessageType.EXCEPTION,
-          clientId)
-        val seqIdFilter = if (protocolFactory.isInstanceOf[TBinaryProtocol.Factory] && !useCallerSeqIds)
-          new SeqIdFilter else Filter.identity[ThriftClientRequest, Array[Byte]]
-        seqIdFilter andThen tracingFilter andThen service
-      }
-    }
+  override val protocolLibraryName: String = "thrift"
 }
+
 
 /**
  * ThriftClientChannelBufferEncoder translates ThriftClientRequests to
@@ -106,14 +88,16 @@ private[thrift] class ThriftClientChannelBufferEncoder
         Channels.write(ctx, e.getFuture, ChannelBuffers.wrappedBuffer(request.message))
         if (request.oneway) {
           // oneway RPCs are satisfied when the write is complete.
-          e.getFuture() {
-            case Ok(_) =>
-              Channels.fireMessageReceived(ctx, ChannelBuffers.EMPTY_BUFFER)
-            case Error(e) =>
-              Channels.fireExceptionCaught(ctx, e)
-            case Cancelled =>
-              Channels.fireExceptionCaught(ctx, new CancelledRequestException)
-          }
+          e.getFuture.addListener(new ChannelFutureListener {
+            override def operationComplete(f: ChannelFuture): Unit =
+              if (f.isSuccess) {
+                Channels.fireMessageReceived(ctx, ChannelBuffers.EMPTY_BUFFER)
+              } else if (f.isCancelled) {
+                Channels.fireExceptionCaught(ctx, new CancelledRequestException)
+              } else {
+                Channels.fireExceptionCaught(ctx, f.getCause)
+              }
+          })
         }
 
       case _ =>
@@ -122,66 +106,64 @@ private[thrift] class ThriftClientChannelBufferEncoder
 }
 
 /**
- * ThriftClientTracingFilter implements Trace support for thrift. This
- * is applied *after* the Channel has been upgraded (via
- * negotiation). It serializes the current Trace into a header
- * on the wire. It is applied after all framing.
- *
- * @param isUpgraded Whether this connection is with a server that has tracing enabled
+ * A class to prepare a client for upgrade: it attempts to send a
+ * probe message to upgrade the protocol to TTwitter. If this
+ * succeds, the TTwitter filter is added.
  */
+private[finagle] case class ThriftClientPreparer(
+    protocolFactory: TProtocolFactory,
+    serviceName: String = "unknown",
+    clientId: Option[ClientId] = None,
+    useCallerSeqIds: Boolean = false) {
 
-private[thrift] class ThriftClientTracingFilter(
-  serviceName: String, isUpgraded: Boolean, clientId: Option[ClientId]
-)
-  extends SimpleFilter[ThriftClientRequest, Array[Byte]]
-{
-  def apply(
-    request: ThriftClientRequest,
+  def prepareService(
     service: Service[ThriftClientRequest, Array[Byte]]
-  ) = {
-    // Create a new span identifier for this request.
-    val msg = new InputBuffer(request.message)().readMessageBegin()
-    Trace.recordRpcname(serviceName, msg.name)
+  ): Future[Service[ThriftClientRequest, Array[Byte]]] = {
+    // Attempt to upgrade the protocol the first time around by
+    // sending a magic method invocation.
+    val buffer = new OutputBuffer(protocolFactory)
+    buffer().writeMessageBegin(
+      new TMessage(ThriftTracing.CanTraceMethodName, TMessageType.CALL, 0))
 
-    val thriftRequest = if (isUpgraded) {
-      val header = new thrift.RequestHeader
-      header.setSpan_id(Trace.id.spanId.toLong)
-      Trace.id._parentId foreach { id => header.setParent_span_id(id.toLong) }
-      header.setTrace_id(Trace.id.traceId.toLong)
+    val options = new thrift.ConnectionOptions
+    options.write(buffer())
 
-      clientId foreach { clientId =>
-        header.setClient_id(clientId.toThrift)
-      }
+    buffer().writeMessageEnd()
 
-      Trace.id.sampled match {
-        case Some(s) => header.setSampled(s)
-        case None => header.unsetSampled()
-      }
+    service(new ThriftClientRequest(buffer.toArray, false)) map { bytes =>
+      val memoryTransport = new TMemoryInputTransport(bytes)
+      val iprot = protocolFactory.getProtocol(memoryTransport)
+      val reply = iprot.readMessageBegin()
+      val ttwitter = new TTwitterClientFilter(
+        serviceName,
+        reply.`type` != TMessageType.EXCEPTION,
+        clientId, protocolFactory)
+      // TODO: also apply this for Protocols.binaryFactory
+      val seqIdFilter =
+        if (protocolFactory.isInstanceOf[TBinaryProtocol.Factory] && !useCallerSeqIds)
+          new SeqIdFilter
+        else
+          Filter.identity[ThriftClientRequest, Array[Byte]]
 
-      new ThriftClientRequest(
-        ByteArrays.concat(OutputBuffer.messageToArray(header), request.message),
-        request.oneway)
-    } else {
-      request
+      val filtered = seqIdFilter andThen ttwitter andThen service
+      new ValidateThriftService(filtered, protocolFactory)
     }
+  }
 
-    Trace.record(Annotation.ClientSend())
-    val reply = service(thriftRequest)
-    if (thriftRequest.oneway) {
-      // Oneway requests don't contain replies, and so they can't be
-      // traced.
-      reply
-    } else {
-      reply map { response =>
-        Trace.record(Annotation.ClientRecv())
+  def prepare(underlying: ServiceFactory[ThriftClientRequest, Array[Byte]]) =
+    underlying flatMap prepareService
+}
 
-        if (isUpgraded) {
-          // Peel off the ResponseHeader.
-          InputBuffer.peelMessage(response, new thrift.ResponseHeader)
-        } else {
-          response
-        }
-      }
-    }
+/**
+ * A Netty ChannelPipelineFactory for framing and deframing thrift messages
+  */
+private[finagle]
+object ThriftClientFramedPipelineFactory extends ChannelPipelineFactory {
+  def getPipeline() = {
+    val pipeline = Channels.pipeline()
+    pipeline.addLast("thriftFrameCodec", new ThriftFrameCodec)
+    pipeline.addLast("byteEncoder",      new ThriftClientChannelBufferEncoder)
+    pipeline.addLast("byteDecoder",      new ThriftChannelBufferDecoder)
+    pipeline
   }
 }

@@ -1,7 +1,6 @@
 package com.twitter.finagle.http.path
 
-import org.jboss.netty.handler.codec.http.HttpMethod
-import com.twitter.finagle.http.ParamMap
+import com.twitter.finagle.http.{ParamMap, Method}
 
 
 /** Base class for path extractors. */
@@ -81,10 +80,15 @@ object -> {
    *   (request.method, Path(request.path)) match {
    *     case Methd.Get -> Root / "test.json" => ...
    */
-  def unapply(x: (HttpMethod, Path)) = Some(x)
+  def unapply(x: (Method, Path)) = Some(x)
 }
 
 
+/**
+ * Path separator extractor:
+ *   Path("/1/2/3/test.json") match {
+ *     case Root / "1" / "2" / "3" / "test.json" => ...
+ */
 case class /(parent: Path, child: String) extends Path {
   lazy val toList: List[String] = parent.toList ++ List(child)
   def lastOption: Option[String] = Some(child)
@@ -115,7 +119,7 @@ case object Root extends Path {
 /**
  * Path separator extractor:
  *   Path("/1/2/3/test.json") match {
- *     case Root / "1" / "2" / "3" / "test.json" => ...
+ *     case "1" /: "2" /: _ =>  ...
  */
 object /: {
   def unapply(path: Path): Option[(String, Path)] = {
@@ -130,8 +134,10 @@ object /: {
 // Base class for Integer and Long extractors.
 protected class Numeric[A <: AnyVal](cast: String => A) {
   def unapply(str: String): Option[A] = {
-    if (!str.isEmpty && str.forall(Character.isDigit _))
-      try {
+    if (!str.isEmpty &&
+       (str.head == '-' || Character.isDigit(str.head)) &&
+       str.drop(1).forall(Character.isDigit)
+    ) try {
         Some(cast(str))
       } catch {
         case _: NumberFormatException =>
@@ -211,6 +217,24 @@ abstract class LongParamMatcher(name: String) {
     params.get(name) flatMap { value =>
       try {
         Some(value.toLong)
+      } catch {
+        case ex: NumberFormatException =>
+          None
+      }
+    }
+}
+
+/**
+ * Double param extractor:
+ *   object Latitude extends DoubleParamMatcher("lat")
+ *   (Path(request.path) :? request.params) match {
+ *     case Root / "closest" :? Latitude("lat") => ...
+ */
+abstract class DoubleParamMatcher(name: String) {
+  def unapply(params: ParamMap): Option[Double] =
+    params.get(name) flatMap { value =>
+      try {
+        Some(value.toDouble)
       } catch {
         case ex: NumberFormatException =>
           None

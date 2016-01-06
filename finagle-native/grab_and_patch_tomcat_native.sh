@@ -1,10 +1,10 @@
 #!/bin/bash
 
-VER="1.1.22"
+VER="1.1.27"
 REL="tomcat-native-$VER"
-URL="http://www.apache.org/dist/tomcat/tomcat-connectors/native/$VER/source/$REL-src.tar.gz"
-TARBALL="$REL-src.tar.gz"
 SRC="$REL-src"
+TARBALL="$SRC.tar.gz"
+URL="http://archive.apache.org/dist/tomcat/tomcat-connectors/native/$VER/source/$TARBALL"
 
 here=`dirname $0`
 
@@ -22,7 +22,7 @@ test -f $TARBALL || \
 
 tar zxf $TARBALL
 cd $SRC > /dev/null
-git apply < ../tomcat-native-$VER.finagle.patch || die "patch did not apply"
+patch -p1 < ../tomcat-native-$VER.finagle.patch || die "patch did not apply"
 cd - > /dev/null
 rm $TARBALL
 

@@ -1,19 +1,15 @@
 package com.twitter.finagle.exception
 
-import java.net.{SocketAddress, InetSocketAddress, InetAddress}
-import scala.collection.JavaConversions._
-
-import org.apache.thrift.protocol.TBinaryProtocol
-import org.apache.scribe.{LogEntry, ResultCode, scribe}
-
-import com.twitter.util.GZIPStringEncoder
-import com.twitter.util.{Time, Monitor, NullMonitor}
-
-import com.twitter.finagle.tracing.Trace
-import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
+import com.twitter.app.GlobalFlag
+import com.twitter.conversions.time._
 import com.twitter.finagle.builder.ClientBuilder
-import com.twitter.finagle.thrift.ThriftClientFramedCodec
-
+import com.twitter.finagle.exception.thriftscala.{LogEntry, ResultCode, Scribe, Scribe$FinagleClient}
+import com.twitter.finagle.stats.{ClientStatsReceiver, NullStatsReceiver, StatsReceiver}
+import com.twitter.finagle.thrift.{Protocols, ThriftClientFramedCodec}
+import com.twitter.finagle.tracing.Trace
+import com.twitter.finagle.util.ReporterFactory
+import com.twitter.util.{Future, GZIPStringEncoder, Monitor, NullMonitor, Time}
+import java.net.{InetAddress, InetSocketAddress, SocketAddress}
 
 trait ClientMonitorFactory extends (String => Monitor)
 trait ServerMonitorFactory extends ((String, SocketAddress) => Monitor)
@@ -22,8 +18,10 @@ trait MonitorFactory extends ServerMonitorFactory with ClientMonitorFactory {
   def clientMonitor(serviceName: String): Monitor
   def serverMonitor(serviceName: String, address: SocketAddress): Monitor
 
-  def apply(serviceName: String) = clientMonitor(serviceName)
-  def apply(serviceName: String, address: SocketAddress) = serverMonitor(serviceName, address)
+  def apply(serviceName: String): Monitor = clientMonitor(serviceName)
+
+  def apply(serviceName: String, address: SocketAddress): Monitor =
+    serverMonitor(serviceName, address)
 }
 
 object NullMonitorFactory extends MonitorFactory {
@@ -59,7 +57,7 @@ object Reporter {
    */
   @deprecated("Use reporterFactory instead")
   def clientReporter(scribeHost: String, scribePort: Int): String => Monitor = {
-    monitorFactory(scribeHost, scribePort).clientMonitor _
+    monitorFactory(scribeHost, scribePort).clientMonitor
   }
 
   /**
@@ -73,7 +71,7 @@ object Reporter {
    */
   @deprecated("Use reporterFactory instead")
   def sourceReporter(scribeHost: String, scribePort: Int): (String, SocketAddress) => Monitor = {
-    monitorFactory(scribeHost, scribePort).serverMonitor _
+    monitorFactory(scribeHost, scribePort).serverMonitor
   }
 
 
@@ -84,21 +82,28 @@ object Reporter {
   def monitorFactory(scribeHost: String, scribePort: Int): MonitorFactory = new MonitorFactory {
     private[this] val scribeClient = makeClient(scribeHost, scribePort)
 
-    def clientMonitor(serviceName: String) =
+    def clientMonitor(serviceName: String): Reporter =
       new Reporter(scribeClient, serviceName).withClient()
-    def serverMonitor(serviceName: String, address: SocketAddress) =
+    def serverMonitor(serviceName: String, address: SocketAddress): Reporter =
       new Reporter(scribeClient, serviceName).withSource(address)
   }
 
 
-  private[this] def makeClient(scribeHost: String, scribePort: Int) = {
+  private[exception] def makeClient(scribeHost: String, scribePort: Int) = {
     val service = ClientBuilder() // these are from the zipkin tracer
+      .name("exception_reporter")
       .hosts(new InetSocketAddress(scribeHost, scribePort))
       .codec(ThriftClientFramedCodec())
+      .reportTo(ClientStatsReceiver)
       .hostConnectionLimit(5)
+      // using an arbitrary, but bounded number of waiters to avoid memory leaks
+      .hostConnectionMaxWaiters(250)
+      // somewhat arbitrary, but bounded timeouts
+      .timeout(1.second)
+      .daemon(true)
       .build()
 
-    new scribe.ServiceToClient(service, new TBinaryProtocol.Factory())
+    new Scribe$FinagleClient(service, Protocols.binaryFactory())
   }
 }
 
@@ -114,29 +119,34 @@ object Reporter {
  * is very wrong!
  */
 sealed case class Reporter(
-  client: scribe.ServiceToClient,
-  serviceName: String,
-  statsReceiver: StatsReceiver = NullStatsReceiver,
-  private val sourceAddress: Option[String] = None,
-  private val clientAddress: Option[String] = None) extends Monitor {
+    client: Scribe[Future],
+    serviceName: String,
+    statsReceiver: StatsReceiver = NullStatsReceiver,
+    private val sourceAddress: Option[String] = Some(InetAddress.getLoopbackAddress.getHostName),
+    private val clientAddress: Option[String] = None)
+  extends Monitor {
+
+  private[this] val okCounter = statsReceiver.counter("report_exception_ok")
+  private[this] val tryLaterCounter = statsReceiver.counter("report_exception_ok")
 
   /**
    * Add a modifier to append a client address (i.e. endpoint) to a generated ServiceException.
    *
    * The endpoint string is the ip address of the host (e.g. "127.0.0.1").
    */
-  def withClient(address: InetAddress = InetAddress.getLocalHost) =
+  def withClient(address: InetAddress = InetAddress.getLoopbackAddress): Reporter =
     copy(clientAddress = Some(address.getHostAddress))
 
   /**
    * Add a modifier to append a source address (i.e. endpoint) to a generated ServiceException.
    *
    * The endpoint string is the ip of the host concatenated with the port of the socket (e.g.
-   * "127.0.0.1:8080").
+   * "127.0.0.1:8080").  This is retained for orthogonality of exterior
+   * interfaces.  We use the host name internaly.
    */
-  def withSource(address: SocketAddress) =
+  def withSource(address: SocketAddress): Reporter =
     address match {
-      case isa: InetSocketAddress => copy(sourceAddress = Some(isa.getAddress.getHostAddress + ":" + isa.getPort))
+      case isa: InetSocketAddress => copy(sourceAddress = Some(isa.getAddress.getHostName))
       case _ => this // don't deal with non-InetSocketAddress types, but don't crash either
     }
 
@@ -144,13 +154,13 @@ sealed case class Reporter(
    * Create a default ServiceException and fold in the modifiers (i.e. to add a source/client
    * endpoint).
    */
-  def createEntry(e: Throwable) = {
+  def createEntry(e: Throwable): LogEntry = {
     var se = new ServiceException(serviceName, e, Time.now, Trace.id.traceId.toLong)
 
     sourceAddress foreach { sa => se = se withSource sa }
     clientAddress foreach { ca => se = se withClient ca }
 
-    new LogEntry(Reporter.scribeCategory, GZIPStringEncoder.encodeString(se.toJson))
+    LogEntry(Reporter.scribeCategory, GZIPStringEncoder.encodeString(se.toJson))
   }
 
   /**
@@ -159,14 +169,27 @@ sealed case class Reporter(
    * See top level comment for this class for more details on performance
    * implications.
    */
-  def handle(t: Throwable) = {
-    client.Log(createEntry(t) :: Nil) onSuccess {
-      case ResultCode.OK => statsReceiver.counter("report_exception_ok").incr()
-      case ResultCode.TRY_LATER => statsReceiver.counter("report_exception_try_later").incr()
+  def handle(t: Throwable): Boolean = {
+    client.log(createEntry(t) :: Nil) onSuccess {
+      case ResultCode.Ok => okCounter.incr()
+      case ResultCode.TryLater => tryLaterCounter.incr()
     } onFailure {
       case e => statsReceiver.counter("report_exception_" + e.toString).incr()
     }
 
     false  // did not actually handle
+  }
+}
+
+object host extends GlobalFlag[InetSocketAddress](
+  new InetSocketAddress("localhost", 1463),
+  "Host to scribe exception messages")
+
+class ExceptionReporter extends ReporterFactory {
+  private[this] val client = Reporter.makeClient(host().getHostName, host().getPort)
+
+  def apply(name: String, addr: Option[SocketAddress]): Reporter = addr match {
+    case Some(a: InetSocketAddress) => new Reporter(client, name).withClient(a.getAddress)
+    case _ => new Reporter(client, name)
   }
 }

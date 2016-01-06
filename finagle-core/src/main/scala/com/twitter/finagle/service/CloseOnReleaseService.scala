@@ -1,12 +1,13 @@
 package com.twitter.finagle.service
 
+import com.twitter.finagle.{Status, Service, ServiceClosedException, ServiceProxy, WriteException}
+import com.twitter.util.{Future, Time}
 import java.util.concurrent.atomic.AtomicBoolean
 
-import com.twitter.util.Future
-
-import com.twitter.finagle.{
-  Service, ServiceClosedException, ServiceProxy, WriteException}
-
+/**
+ * A [[com.twitter.finagle.Service]] that rejects all requests after its `close`
+ * method has been invoked.
+ */
 private[finagle] class CloseOnReleaseService[Req, Rep](underlying: Service[Req, Rep])
   extends ServiceProxy[Req, Rep](underlying)
 {
@@ -17,14 +18,18 @@ private[finagle] class CloseOnReleaseService[Req, Rep](underlying: Service[Req, 
       super.apply(request)
     } else {
       Future.exception(
-        new WriteException(new ServiceClosedException))
+        WriteException(new ServiceClosedException))
     }
   }
 
-  override def release() {
+  override def close(deadline: Time) = {
     if (wasReleased.compareAndSet(false, true))
-      super.release()
+      super.close(deadline)
+    else
+      Future.Done
   }
 
-  override def isAvailable = !wasReleased.get && super.isAvailable
+  override def status = 
+    if (wasReleased.get) Status.Closed
+    else super.status
 }

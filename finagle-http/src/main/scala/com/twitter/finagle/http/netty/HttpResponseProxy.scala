@@ -4,11 +4,11 @@ import org.jboss.netty.handler.codec.http.{HttpMessage, HttpResponse, HttpRespon
 
 
 /** Proxy for HttpResponse.  Used by Response. */
-trait HttpResponseProxy extends HttpResponse with HttpMessageProxy {
-  def httpResponse: HttpResponse
-  def getHttpResponse(): HttpResponse = httpResponse
-  def httpMessage: HttpMessage = httpResponse
+private[finagle] trait HttpResponseProxy extends HttpMessageProxy {
+  protected[finagle] def httpResponse: HttpResponse
+  protected[finagle] def getHttpResponse(): HttpResponse = httpResponse
+  protected[finagle] def httpMessage: HttpMessage = httpResponse
 
-  def getStatus(): HttpResponseStatus       = httpResponse.getStatus()
-  def setStatus(status: HttpResponseStatus) { httpResponse.setStatus(status) }
+  protected[finagle] def getStatus(): HttpResponseStatus       = httpResponse.getStatus()
+  protected[finagle] def setStatus(status: HttpResponseStatus) { httpResponse.setStatus(status) }
 }

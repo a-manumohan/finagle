@@ -5,6 +5,10 @@ import java.net.{InetAddress, Inet4Address}
 
 
 object InetAddressUtil {
+
+  @deprecated("use java.net.InetAddress.getLoopbackAddress instead", "2014-12-10")
+  val Loopback = InetAddress.getByAddress(Array[Byte](127,0,0,1))
+
   /** Check if string is an IPv4 private address. */
   def isPrivateAddress(ip: InetAddress): Boolean =
     ip match {

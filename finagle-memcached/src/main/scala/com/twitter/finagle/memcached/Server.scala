@@ -1,18 +1,22 @@
 package com.twitter.finagle.memcached
-import _root_.java.net.SocketAddress
-import org.jboss.netty.channel.Channel
-import com.twitter.util.SynchronizedLruMap
-import org.jboss.netty.buffer.ChannelBuffer
-import util.AtomicMap
-import com.twitter.finagle.builder.{Server => BuiltServer, ServerBuilder}
-import protocol.text.Memcached
 
+import _root_.java.net.SocketAddress
+import com.twitter.finagle.builder.{Server => BuiltServer, ServerBuilder}
+import com.twitter.finagle.memcached.protocol.text
+import com.twitter.finagle.memcached.util.AtomicMap
+import com.twitter.io.Buf
+import com.twitter.util.{Await, SynchronizedLruMap}
+
+/**
+ * An in-process memcached server.
+ */
+@deprecated("Moved into test", "7.0.0")
 class Server(address: SocketAddress) {
   val concurrencyLevel = 16
   val slots = 500000
   val slotsPerLru = slots / concurrencyLevel
   val maps = (0 until concurrencyLevel) map { i =>
-    new SynchronizedLruMap[ChannelBuffer, ChannelBuffer](slotsPerLru)
+    new SynchronizedLruMap[Buf, Entry](slotsPerLru)
   }
 
   private[this] val service = {
@@ -23,7 +27,7 @@ class Server(address: SocketAddress) {
   private[this] val serverSpec =
     ServerBuilder()
       .name("finagle")
-      .codec(Memcached())
+      .codec(text.Memcached())
       .bindTo(address)
 
   private[this] var server: Option[BuiltServer] = None
@@ -33,11 +37,10 @@ class Server(address: SocketAddress) {
     server.get
   }
 
-  def stop() {
-    require(server.isDefined, "Server is not open!")
-
+  def stop(blocking: Boolean = false) {
     server.foreach { server =>
-      server.close()
+      if (blocking) Await.result(server.close())
+      else server.close()
       this.server = None
     }
   }

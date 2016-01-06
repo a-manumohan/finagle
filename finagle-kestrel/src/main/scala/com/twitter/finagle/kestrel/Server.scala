@@ -5,21 +5,20 @@ import _root_.java.util.concurrent.{BlockingDeque, LinkedBlockingDeque}
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import com.twitter.finagle.builder.{Server => BuiltServer, ServerBuilder}
 import com.twitter.finagle.{ServiceFactory, ClientConnection}
-import com.twitter.util.Future
-import org.jboss.netty.buffer.ChannelBuffer
+import com.twitter.io.Buf
+import com.twitter.util.{Future, Time}
 import protocol.{Kestrel, Command, Response}
-import scala.collection.mutable
 
 class Server(address: SocketAddress) {
   private[this] val serviceFactory = new ServiceFactory[Command, Response] {
 
     private[this] val queues = CacheBuilder.newBuilder()
-      .build(new CacheLoader[ChannelBuffer, BlockingDeque[ChannelBuffer]] {
-        def load(k: ChannelBuffer) = new LinkedBlockingDeque[ChannelBuffer]
+      .build(new CacheLoader[Buf, BlockingDeque[Buf]] {
+        def load(k: Buf) = new LinkedBlockingDeque[Buf]
       })
 
     def apply(conn: ClientConnection) = Future.value(new InterpreterService(new Interpreter(queues)))
-    def close() = ()
+    def close(deadline: Time) = Future.Done
   }
 
   private[this] val serverSpec =

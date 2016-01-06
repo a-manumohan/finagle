@@ -1,0 +1,29 @@
+#!/bin/bash
+
+set -xe
+
+# Publish local dependencies when not in a master branch
+FINAGLE_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+if [ "$FINAGLE_BRANCH" != "master" ]; then
+  FINAGLE_DIR=$(pwd)
+  FINAGLE_TMP_DIR=$(mktemp -d -t finagle.XXXXXXXXXX.tmp)
+  # util
+  cd $FINAGLE_TMP_DIR
+  git clone https://github.com/twitter/util.git --branch develop
+  cd util
+  ./sbt ++$TRAVIS_SCALA_VERSION publishLocal
+  # ostrich
+  cd $FINAGLE_TMP_DIR
+  git clone https://github.com/twitter/ostrich.git --branch develop
+  cd ostrich
+  ./sbt ++$TRAVIS_SCALA_VERSION publishLocal
+  # scrooge-core. Finagle depends on scrooge-core, the rest of scrooge depends on finagle.
+  cd $FINAGLE_TMP_DIR
+  git clone https://github.com/twitter/scrooge.git --branch develop
+  cd scrooge
+  ./sbt ++$TRAVIS_SCALA_VERSION scrooge-core/publishLocal
+  # clean up
+  cd $FINAGLE_DIR
+  rm -rf $FINAGLE_TMP_DIR
+fi

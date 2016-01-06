@@ -1,46 +1,66 @@
 package com.twitter.finagle.http
 
-import com.twitter.util.Duration
+import com.twitter.io.{Buf, Reader => BufReader, Writer => BufWriter}
+import com.twitter.finagle.netty3.{ChannelBufferBuf, BufChannelBuffer}
+import com.twitter.finagle.http.netty.{HttpMessageProxy, Bijections}
+import com.twitter.util.{Await, Duration, Closable}
 import java.io.{InputStream, InputStreamReader, OutputStream, OutputStreamWriter, Reader, Writer}
 import java.util.{Iterator => JIterator}
 import java.nio.charset.Charset
 import java.util.{Date, TimeZone}
 import org.apache.commons.lang.StringUtils
 import org.apache.commons.lang.time.FastDateFormat
-import org.jboss.netty.buffer._
-import org.jboss.netty.handler.codec.http.{Cookie, HttpMessage, HttpHeaders, HttpMethod,
-  HttpVersion}
-import scala.collection.JavaConversions._
-import scala.reflect.BeanProperty
+import org.jboss.netty.buffer.{
+  ChannelBufferInputStream, DynamicChannelBuffer, ChannelBuffer,
+  ChannelBufferOutputStream, ChannelBuffers
+}
+import scala.collection.JavaConverters._
 
+import Bijections._
 
 /**
- * Rich HttpMessage
+ * Rich Message
  *
  * Base class for Request and Response.  There are both input and output
  * methods, though only one set of methods should be used.
  */
-abstract class Message extends HttpMessage {
+abstract class Message extends HttpMessageProxy {
+
+  private[this] val readerWriter = BufReader.writable()
+
+  /**
+   * A read-only handle to the internal stream of bytes, representing the
+   * message body. See [[com.twitter.io.Reader]] for more information.
+   **/
+  def reader: BufReader = readerWriter
+
+  /**
+   * A write-only handle to the internal stream of bytes, representing the
+   * message body. See [[com.twitter.io.Writer]] for more information.
+   **/
+  def writer: BufWriter with Closable = readerWriter
 
   def isRequest: Boolean
   def isResponse = !isRequest
 
-  def content: ChannelBuffer = getContent()
-  def content_=(content: ChannelBuffer) { setContent(content) }
+  // XXX should we may be using the Shared variants here?
+  def content: Buf = ChannelBufferBuf.Owned(getContent())
+  def content_=(content: Buf) { setContent(BufChannelBuffer(content)) }
 
-  def version: HttpVersion = getProtocolVersion()
-  def version_=(version: HttpVersion) { setProtocolVersion(version) }
+  def version: Version = from(getProtocolVersion())
+  def version_=(version: Version) { setProtocolVersion(from(version)) }
 
-  lazy val headers = new HeaderMap(this)
-  // Java users: use Netty HttpMessage interface for headers
+  lazy val headerMap: HeaderMap = new MessageHeaderMap(this)
 
-  /** Cookies.  In a request, this uses the Cookie headers.  In a response, it
-    * uses the Set-Cookie headers. */
-  lazy val cookies = new CookieSet(this)
+  /**
+   * Cookies. In a request, this uses the Cookie headers.
+   * In a response, it uses the Set-Cookie headers.
+   */
+  lazy val cookies = new CookieMap(this)
   // Java users: use the interface below for cookies
 
   /** Get iterator over Cookies */
-  def getCookies(): JIterator[Cookie] = cookies.iterator
+  def getCookies(): JIterator[Cookie] = cookies.valuesIterator.asJava
 
   /** Add a cookie */
   def addCookie(cookie: Cookie) {
@@ -48,18 +68,18 @@ abstract class Message extends HttpMessage {
   }
 
   /** Remove a cookie */
-  def removeCookie(cookie: Cookie) {
-    cookies -= cookie
+  def removeCookie(name: String) {
+    cookies -= name
   }
 
   /** Accept header */
   def accept: Seq[String] =
-    Option(getHeader(HttpHeaders.Names.ACCEPT)) match {
+    Option(headers.get(Fields.Accept)) match {
       case Some(s) => s.split(",").map(_.trim).filter(_.nonEmpty)
       case None    => Seq()
     }
   /** Set Accept header */
-  def accept_=(value: String) { setHeader(HttpHeaders.Names.ACCEPT, value) }
+  def accept_=(value: String) { headers.set(Fields.Accept, value) }
   /** Set Accept header with list of values */
   def accept_=(values: Iterable[String]) { accept = values.mkString(", ") }
 
@@ -72,21 +92,21 @@ abstract class Message extends HttpMessage {
     }.flatten
 
   /** Allow header */
-  def allow: Option[String] = Option(getHeader(HttpHeaders.Names.ALLOW))
+  def allow: Option[String] = Option(headers.get(Fields.Allow))
   /** Set Authorization header */
-  def allow_=(value: String) { setHeader(HttpHeaders.Names.ALLOW, value) }
+  def allow_=(value: String) { headers.set(Fields.Allow, value) }
   /** Set Authorization header */
-  def allow_=(values: Iterable[HttpMethod]) { allow = values.mkString(",") }
+  def allow_=(values: Iterable[Method]) { allow = values.mkString(",").toUpperCase }
 
   /** Get Authorization header */
-  def authorization: Option[String] = Option(getHeader(HttpHeaders.Names.AUTHORIZATION))
+  def authorization: Option[String] = Option(headers.get(Fields.Authorization))
   /** Set Authorization header */
-  def authorization_=(value: String) { setHeader(HttpHeaders.Names.AUTHORIZATION, value) }
+  def authorization_=(value: String) { headers.set(Fields.Authorization, value) }
 
   /** Get Cache-Control header */
-  def cacheControl: Option[String] = Option(getHeader(HttpHeaders.Names.CACHE_CONTROL))
+  def cacheControl: Option[String] = Option(headers.get(Fields.CacheControl))
   /** Set Cache-Control header */
-  def cacheControl_=(value: String) { setHeader(HttpHeaders.Names.CACHE_CONTROL, value) }
+  def cacheControl_=(value: String) { headers.set(Fields.CacheControl, value) }
   /** Set Cache-Control header with a max-age (and must-revalidate). */
   def cacheControl_=(maxAge: Duration) {
     cacheControl = "max-age=" + maxAge.inSeconds.toString + ", must-revalidate"
@@ -144,54 +164,54 @@ abstract class Message extends HttpMessage {
 
   /** Get Content-Length header.  Use length to get the length of actual content. */
   def contentLength: Option[Long] =
-    Option(getHeader(HttpHeaders.Names.CONTENT_LENGTH)).map { _.toLong }
+    Option(headers.get(Fields.ContentLength)).map { _.toLong }
   /** Set Content-Length header.  Normally, this is automatically set by the
     * Codec, but this method allows you to override that. */
   def contentLength_=(value: Long) {
-    setHeader(HttpHeaders.Names.CONTENT_LENGTH, value.toString)
+    headers.set(Fields.ContentLength, value.toString)
   }
 
   /** Get Content-Type header */
-  def contentType: Option[String] = Option(getHeader(HttpHeaders.Names.CONTENT_TYPE))
+  def contentType: Option[String] = Option(headers.get(Fields.ContentType))
   /** Set Content-Type header */
-  def contentType_=(value: String) { setHeader(HttpHeaders.Names.CONTENT_TYPE, value) }
+  def contentType_=(value: String) { headers.set(Fields.ContentType, value) }
   /** Set Content-Type header by media-type and charset */
   def setContentType(mediaType: String, charset: String = "utf-8") {
-    setHeader(HttpHeaders.Names.CONTENT_TYPE, mediaType + ";charset=" + charset)
+    headers.set(Fields.ContentType, mediaType + ";charset=" + charset)
   }
   /** Set Content-Type header to application/json;charset=utf-8 */
-  def setContentTypeJson() { setHeader(HttpHeaders.Names.CONTENT_TYPE, Message.ContentTypeJson) }
+  def setContentTypeJson() { headers.set(Fields.ContentType, Message.ContentTypeJson) }
 
   /** Get Date header */
-  def date: Option[String] = Option(getHeader(HttpHeaders.Names.DATE))
+  def date: Option[String] = Option(headers.get(Fields.Date))
   /** Set Date header */
-  def date_=(value: String) { setHeader(HttpHeaders.Names.DATE, value) }
+  def date_=(value: String) { headers.set(Fields.Date, value) }
   /** Set Date header by Date */
   def date_=(value: Date) { date = Message.httpDateFormat(value) }
 
   /** Get Expires header */
-  def expires: Option[String] = Option(getHeader(HttpHeaders.Names.EXPIRES))
+  def expires: Option[String] = Option(headers.get(Fields.Expires))
   /** Set Expires header */
-  def expires_=(value: String) { setHeader(HttpHeaders.Names.EXPIRES, value) }
+  def expires_=(value: String) { headers.set(Fields.Expires, value) }
   /** Set Expires header by Date */
   def expires_=(value: Date) { expires = Message.httpDateFormat(value) }
 
   /** Get Host header */
-  def host: Option[String] =  Option(getHeader(HttpHeaders.Names.HOST))
+  def host: Option[String] =  Option(headers.get(Fields.Host))
   /** Set Host header */
-  def host_=(value: String) { setHeader(HttpHeaders.Names.HOST, value) }
+  def host_=(value: String) { headers.set(Fields.Host, value) }
 
   /** Get Last-Modified header */
-  def lastModified: Option[String] = Option(getHeader(HttpHeaders.Names.LAST_MODIFIED))
+  def lastModified: Option[String] = Option(headers.get(Fields.LastModified))
   /** Set Last-Modified header */
-  def lastModified_=(value: String) { setHeader(HttpHeaders.Names.LAST_MODIFIED, value) }
+  def lastModified_=(value: String) { headers.set(Fields.LastModified, value) }
   /** Set Last-Modified header by Date */
   def lastModified_=(value: Date) { lastModified = Message.httpDateFormat(value) }
 
   /** Get Location header */
-  def location: Option[String] = Option(getHeader(HttpHeaders.Names.LOCATION))
+  def location: Option[String] = Option(headers.get(Fields.Location))
   /** Set Location header */
-  def location_=(value: String) { setHeader(HttpHeaders.Names.LOCATION, value) }
+  def location_=(value: String) { headers.set(Fields.Location, value) }
 
   /** Get media-type from Content-Type header */
   def mediaType: Option[String] =
@@ -226,36 +246,36 @@ abstract class Message extends HttpMessage {
   }
 
   /** Get Referer [sic] header */
-  def referer: Option[String] = Option(getHeader(HttpHeaders.Names.REFERER))
+  def referer: Option[String] = Option(headers.get(Fields.Referer))
   /** Set Referer [sic] header */
-  def referer_=(value: String) { setHeader(HttpHeaders.Names.REFERER, value) }
+  def referer_=(value: String) { headers.set(Fields.Referer, value) }
 
   /** Get Retry-After header */
-  def retryAfter: Option[String] = Option(getHeader(HttpHeaders.Names.RETRY_AFTER))
+  def retryAfter: Option[String] = Option(headers.get(Fields.RetryAfter))
   /** Set Retry-After header */
-  def retryAfter_=(value: String) { setHeader(HttpHeaders.Names.RETRY_AFTER, value) }
+  def retryAfter_=(value: String) { headers.set(Fields.RetryAfter, value) }
   /** Set Retry-After header by seconds */
   def retryAfter_=(value: Long) { retryAfter = value.toString }
 
   /** Get Server header */
-  def server: Option[String] = Option(getHeader(HttpHeaders.Names.SERVER))
+  def server: Option[String] = Option(headers.get(Fields.Server))
   /** Set Server header */
-  def server_=(value: String) { setHeader(HttpHeaders.Names.SERVER, value) }
+  def server_=(value: String) { headers.set(Fields.Server, value) }
 
   /** Get User-Agent header */
-  def userAgent: Option[String] = Option(getHeader(HttpHeaders.Names.USER_AGENT))
+  def userAgent: Option[String] = Option(headers.get(Fields.UserAgent))
   /** Set User-Agent header */
-  def userAgent_=(value: String) { setHeader(HttpHeaders.Names.USER_AGENT, value) }
+  def userAgent_=(value: String) { headers.set(Fields.UserAgent, value) }
 
   /** Get WWW-Authenticate header */
-  def wwwAuthenticate: Option[String] = Option(getHeader(HttpHeaders.Names.WWW_AUTHENTICATE))
+  def wwwAuthenticate: Option[String] = Option(headers.get(Fields.WwwAuthenticate))
   /** Set WWW-Authenticate header */
-  def wwwAuthenticate_=(value: String) { setHeader(HttpHeaders.Names.WWW_AUTHENTICATE, value) }
+  def wwwAuthenticate_=(value: String) { headers.set(Fields.WwwAuthenticate, value) }
 
   /** Get X-Forwarded-For header */
-  def xForwardedFor: Option[String] = Option(getHeader("X-Forwarded-For"))
+  def xForwardedFor: Option[String] = Option(headers.get("X-Forwarded-For"))
   /** Set X-Forwarded-For header */
-  def xForwardedFor_=(value: String) { setHeader("X-Forwarded-For", value) }
+  def xForwardedFor_=(value: String) { headers.set("X-Forwarded-For", value) }
 
   /**
    * Check if X-Requested-With contains XMLHttpRequest, usually signalling a
@@ -264,7 +284,7 @@ abstract class Message extends HttpMessage {
    * instead HTML if it's an XmlHttpRequest.  (Tip: don't do this - it's gross.)
    */
   def isXmlHttpRequest = {
-    Option(getHeader("X-Requested-With")) exists { _.toLowerCase.contains("xmlhttprequest") }
+    Option(headers.get("X-Requested-With")) exists { _.toLowerCase.contains("xmlhttprequest") }
   }
 
   /** Get length of content. */
@@ -272,13 +292,21 @@ abstract class Message extends HttpMessage {
   def getLength(): Int = length
 
   /** Get the content as a string. */
-  def contentString: String = getContent.toString(Message.Utf8)
+  def contentString: String = {
+    val encoding = try {
+      Charset.forName(charset getOrElse "UTF-8")
+    } catch {
+      case _: Throwable => Message.Utf8
+    }
+    getContent.toString(encoding)
+  }
+
   def getContentString(): String = contentString
 
   /** Set the content as a string. */
   def contentString_=(value: String) {
     if (value != "")
-      setContent(ChannelBuffers.wrappedBuffer(value.getBytes("UTF-8")))
+      setContent(BufChannelBuffer(Buf.Utf8(value)))
     else
       setContent(ChannelBuffers.EMPTY_BUFFER)
   }
@@ -330,13 +358,24 @@ abstract class Message extends HttpMessage {
     }
   }
 
-  /** Append ChannelBuffer to content. */
+  /** Append ChannelBuffer to content.
+   *
+   * If `isChunked` then multiple writes must be composed using `writer` and
+   * `flatMap` to have the appropriate backpressure semantics.
+   *
+   * Attempting to `write` after calling `close` will result in a thrown
+   * [[com.twitter.io.Reader.ReaderDiscarded]].
+   */
+  @throws(classOf[BufReader.ReaderDiscarded])
+  @throws(classOf[IllegalStateException])
   def write(buffer: ChannelBuffer) {
-    getContent match {
-      case ChannelBuffers.EMPTY_BUFFER =>
-        setContent(buffer)
-      case content =>
-        setContent(ChannelBuffers.wrappedBuffer(content, buffer))
+    if (isChunked) writeChunk(buffer) else {
+      getContent match {
+        case ChannelBuffers.EMPTY_BUFFER =>
+          setContent(buffer)
+        case content =>
+          setContent(ChannelBuffers.wrappedBuffer(content, buffer))
+      }
     }
   }
 
@@ -370,17 +409,22 @@ abstract class Message extends HttpMessage {
   def clearContent() {
     setContent(ChannelBuffers.EMPTY_BUFFER)
   }
+
+  /** End the response stream. */
+  def close() = writer.close()
+
+  private[this] def writeChunk(buf: ChannelBuffer) {
+    if (buf.readable) {
+      val future = writer.write(new ChannelBufferBuf(buf))
+      // Unwraps the future in the Return case, or throws exception in the Throw case.
+      if (future.isDefined) Await.result(future)
+    }
+  }
 }
 
 
 object Message {
-  private val Utf8          = Charset.forName("UTF-8")
-  @deprecated("Use MediaType.Json")
-  val MediaTypeJson         = "application/json"
-  @deprecated("Use MediaType.Javascript")
-  val MediaTypeJavascript   = "application/javascript"
-  @deprecated("Use MediaType.WwwForm")
-  val MediaTypeWwwForm      = "application/x-www-form-urlencoded"
+  private[http] val Utf8          = Charset.forName("UTF-8")
   val CharsetUtf8           = "charset=utf-8"
   val ContentTypeJson       = MediaType.Json + ";" + CharsetUtf8
   val ContentTypeJavascript = MediaType.Javascript + ";" + CharsetUtf8

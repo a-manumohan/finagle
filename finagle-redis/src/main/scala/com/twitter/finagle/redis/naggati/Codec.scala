@@ -17,11 +17,9 @@
 package com.twitter.finagle.redis.naggati
 
 import scala.annotation.tailrec
-import scala.collection.mutable
 import org.jboss.netty.buffer.{ChannelBuffer, ChannelBuffers}
 import org.jboss.netty.channel._
 import org.jboss.netty.handler.codec.frame.FrameDecoder
-import com.twitter.util.Future
 
 /*
  * Convenience exception class to allow decoders to indicate a protocol error.
@@ -118,7 +116,7 @@ class Codec[A: Manifest](
     event match {
       case message: DownstreamMessageEvent => {
         val obj = message.getMessage
-        if (manifest[A].erasure.isAssignableFrom(obj.getClass)) {
+        if (manifest[A].runtimeClass.isAssignableFrom(obj.getClass)) {
           encode(obj.asInstanceOf[A]) match {
             case Some(buffer) =>
               Channels.write(context, message.getFuture, buffer, message.getRemoteAddress)

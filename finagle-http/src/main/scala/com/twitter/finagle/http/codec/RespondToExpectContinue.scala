@@ -10,6 +10,7 @@ import org.jboss.netty.channel.{
   ChannelHandlerContext, MessageEvent}
 import org.jboss.netty.handler.codec.http.{HttpHeaders, HttpRequest}
 
+private[http]
 class RespondToExpectContinue extends SimpleChannelUpstreamHandler {
   override def messageReceived(ctx: ChannelHandlerContext, e: MessageEvent) {
     e.getMessage match {
@@ -21,7 +22,7 @@ class RespondToExpectContinue extends SimpleChannelUpstreamHandler {
 
         // Remove the the ``Expect:'' header, and let the upstream
         // continue receiving chunks after this.
-        request.removeHeader(HttpHeaders.Names.EXPECT)
+        request.headers.remove(HttpHeaders.Names.EXPECT)
 
       case _ => ()
     }

@@ -1,17 +1,16 @@
 package com.twitter.finagle.memcached
 
+import com.twitter.io.Buf
 import com.twitter.util._
 import _root_.java.util.concurrent.Executors
-import org.jboss.netty.buffer.ChannelBuffer
 import scala.collection.mutable.ArrayBuffer
-import com.twitter.conversions.time._
 import _root_.java.util.Random
 
 /**
  * This class is designed to support replicated memcached setups.  It supports a limited
  * subset of operations (just get, set, and delete).
  */
-class PoolingReadRepairClient(allClients: Seq[BaseClient[ChannelBuffer]],
+class PoolingReadRepairClient(allClients: Seq[BaseClient[Buf]],
                               readRepairProbability: Float,
                               readRepairCount: Int = 1,
                               futurePool: FuturePool = new ExecutorServiceFuturePool(Executors.newCachedThreadPool())) extends Client {
@@ -62,7 +61,7 @@ class PoolingReadRepairClient(allClients: Seq[BaseClient[ChannelBuffer]],
 
   def getSubsetOfClients() = {
     val num = if (rand.nextFloat < readRepairProbability) readRepairCount + 1 else 1
-    val buf = new ArrayBuffer[BaseClient[ChannelBuffer]]
+    val buf = new ArrayBuffer[BaseClient[Buf]]
     allClients.copyToBuffer(buf)
     while(buf.size > num) {
       buf.remove(rand.nextInt(buf.size))
@@ -71,7 +70,7 @@ class PoolingReadRepairClient(allClients: Seq[BaseClient[ChannelBuffer]],
   }
 
   def release() = allClients.map(_.release())
-  def set(key: String, flags: Int, expiry: Time, value: ChannelBuffer) = {
+  def set(key: String, flags: Int, expiry: Time, value: Buf) = {
     val futures = allClients.map(_.set(key, flags, expiry, value))
     val base = futures.head
     futures.tail.foldLeft(base)(_.or(_))
@@ -83,10 +82,10 @@ class PoolingReadRepairClient(allClients: Seq[BaseClient[ChannelBuffer]],
   def stats(args: Option[String]) = unsupported
   def decr(key: String,delta: Long) = unsupported
   def incr(key: String,delta: Long) = unsupported
-  def cas(key: String, flags: Int,expiry: Time, value: ChannelBuffer,casUnique: ChannelBuffer) = unsupported
-  def replace(key: String,flags: Int,expiry: Time,value: ChannelBuffer) = unsupported
-  def prepend(key: String,flags: Int,expiry: Time,value: ChannelBuffer) = unsupported
-  def append(key: String,flags: Int,expiry: Time,value: ChannelBuffer) = unsupported
-  def add(key: String,flags: Int,expiry: Time,value: ChannelBuffer) = unsupported
+  def cas(key: String, flags: Int,expiry: Time, value: Buf,casUnique: Buf) = unsupported
+  def replace(key: String,flags: Int,expiry: Time,value: Buf) = unsupported
+  def prepend(key: String,flags: Int,expiry: Time,value: Buf) = unsupported
+  def append(key: String,flags: Int,expiry: Time,value: Buf) = unsupported
+  def add(key: String,flags: Int,expiry: Time,value: Buf) = unsupported
   private def unsupported = throw new UnsupportedOperationException
 }

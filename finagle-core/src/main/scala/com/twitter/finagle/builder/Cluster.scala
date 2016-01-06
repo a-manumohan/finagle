@@ -14,6 +14,7 @@ import java.util.logging.Logger
  * Note that a Cluster can be elastic: members can join or leave at
  * any time.
  */
+@deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "2014-11-21")
 trait Cluster[T] { self =>
   /**
    * A Future object that is defined when the cluster is initialized.
@@ -23,11 +24,11 @@ trait Cluster[T] { self =>
   def ready: Future[Unit] = {
     def flatten(spool: Spool[Cluster.Change[T]]): Future[Unit] = spool match {
       case Cluster.Add(_) *:: tail => Future.Done
-      case _ *:: tail => tail flatMap flatten
+      case _ *:: tail => tail.flatMap(flatten)
     }
 
     snap match {
-      case (current, changes) if current.isEmpty => changes flatMap flatten
+      case (current, changes) if current.isEmpty => changes.flatMap(flatten)
       case _ => Future.Done
     }
   }
@@ -45,13 +46,16 @@ trait Cluster[T] { self =>
     private[this] val mapped = mutable.HashMap.empty[T, mutable.Queue[U]]
 
     override def ready = self.ready
+
     def snap: (Seq[U], Future[Spool[Cluster.Change[U]]]) = {
       val (seqT, changeT) = self.snap
-      val seqU = seqT map { t =>
-        val q = mapped.getOrElseUpdate(t, mutable.Queue[U]())
-        val u = f(t)
-        q.enqueue(u)
-        u
+      val seqU = mapped.synchronized {
+        seqT map { t =>
+          val q = mapped.getOrElseUpdate(t, mutable.Queue[U]())
+          val u = f(t)
+          q.enqueue(u)
+          u
+        }
       }
 
       val changeU = changeT map { spoolT =>
@@ -95,6 +99,7 @@ object Cluster {
 /**
  * A simple static cluster implementation.
  */
-class StaticCluster[T](underlying: Seq[T]) extends Cluster[T] {
+@deprecated("Use `com.twitter.finagle.Name` to represent clusters instead", "2014-11-21")
+case class StaticCluster[T](underlying: Seq[T]) extends Cluster[T] {
   def snap: (Seq[T], Future[Spool[Cluster.Change[T]]]) = (underlying, Future.value(Spool.empty))
 }

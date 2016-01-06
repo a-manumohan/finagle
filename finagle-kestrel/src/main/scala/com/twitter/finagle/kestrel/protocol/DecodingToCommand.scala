@@ -1,30 +1,32 @@
 package com.twitter.finagle.kestrel.protocol
 
-import org.jboss.netty.buffer.ChannelBuffer
 import com.twitter.finagle.memcached.protocol.{ClientError, NonexistentCommand}
-import org.jboss.netty.buffer.ChannelBuffers.copiedBuffer
-import com.twitter.finagle.memcached.util.ChannelBufferUtils._
+import com.twitter.conversions.time._
 import com.twitter.finagle.memcached.protocol.text.server.AbstractDecodingToCommand
+import com.twitter.finagle.memcached.util.Bufs.RichBuf
+import com.twitter.io.Buf
 
 private[kestrel] class DecodingToCommand extends AbstractDecodingToCommand[Command] {
-  private[this] val GET         = copiedBuffer("get"        .getBytes)
-  private[this] val SET         = copiedBuffer("set"        .getBytes)
-  private[this] val DELETE      = copiedBuffer("delete"     .getBytes)
-  private[this] val FLUSH       = copiedBuffer("flush"      .getBytes)
-  private[this] val FLUSH_ALL   = copiedBuffer("flush_all"  .getBytes)
-  private[this] val VERSION     = copiedBuffer("version"    .getBytes)
-  private[this] val SHUTDOWN    = copiedBuffer("shutdown"   .getBytes)
-  private[this] val STATS       = copiedBuffer("stats"      .getBytes)
-  private[this] val DUMP_STATS  = copiedBuffer("dump_stats" .getBytes)
+  private[this] val TimestampPrefix = Buf.Utf8("t=")
 
-  private[this] val OPEN        = copiedBuffer("open"       .getBytes)
-  private[this] val CLOSE       = copiedBuffer("close"      .getBytes)
-  private[this] val ABORT       = copiedBuffer("abort"      .getBytes)
-  private[this] val PEEK        = copiedBuffer("peek"       .getBytes)
+  private[this] val GET         = Buf.Utf8("get")
+  private[this] val SET         = Buf.Utf8("set")
+  private[this] val DELETE      = Buf.Utf8("delete")
+  private[this] val FLUSH       = Buf.Utf8("flush")
+  private[this] val FLUSH_ALL   = Buf.Utf8("flush_all")
+  private[this] val VERSION     = Buf.Utf8("version")
+  private[this] val SHUTDOWN    = Buf.Utf8("shutdown")
+  private[this] val STATS       = Buf.Utf8("stats")
+  private[this] val DUMP_STATS  = Buf.Utf8("dump_stats")
+
+  private[this] val OPEN        = Buf.Utf8("open")
+  private[this] val CLOSE       = Buf.Utf8("close")
+  private[this] val ABORT       = Buf.Utf8("abort")
+  private[this] val PEEK        = Buf.Utf8("peek")
 
   protected val storageCommands = collection.Set(SET)
 
-  def parseStorageCommand(tokens: Seq[ChannelBuffer], data: ChannelBuffer) = {
+  def parseStorageCommand(tokens: Seq[Buf], data: Buf) = {
     val commandName = tokens.head
     val args = tokens.tail
     commandName match {
@@ -35,7 +37,7 @@ private[kestrel] class DecodingToCommand extends AbstractDecodingToCommand[Comma
     }
   }
 
-  def parseNonStorageCommand(tokens: Seq[ChannelBuffer]) = {
+  def parseNonStorageCommand(tokens: Seq[Buf]) = {
     val commandName = tokens.head
     val args = tokens.tail
     commandName match {
@@ -51,21 +53,28 @@ private[kestrel] class DecodingToCommand extends AbstractDecodingToCommand[Comma
     }
   }
 
-  private[this] def validateGetCommand(tokens: Seq[ChannelBuffer]): GetCommand = {
+  private[this] def validateGetCommand(tokens: Seq[Buf]): GetCommand = {
     if (tokens.size < 1) throw new ClientError("Key missing")
     if (tokens.size > 1) throw new ClientError("Too many arguments")
 
-    val split = tokens.head.split("/")
+    val splitAll = tokens.head.split('/')
+
+    val (splitTimeout, split) = splitAll partition { (value: Buf) => value.startsWith(TimestampPrefix) }
+
     val queueName = split.head
 
+    val timeout = splitTimeout.lastOption.map {
+      case Buf.Utf8(s) => s.drop(2).toInt.milliseconds
+    }
+
     split.tail match {
-      case Seq()           => Get(queueName)
-      case Seq(OPEN)       => Open(queueName)
-      case Seq(CLOSE)      => Close(queueName)
-      case Seq(CLOSE,OPEN) => CloseAndOpen(queueName)
-      case Seq(ABORT)      => Abort(queueName)
-      case Seq(PEEK)       => Peek(queueName)
-      case _               => throw new NonexistentCommand(tokens.toString)
+      case Seq()           => Get(queueName, timeout)
+      case Seq(OPEN)       => Open(queueName, timeout)
+      case Seq(CLOSE)      => Close(queueName, timeout)
+      case Seq(CLOSE,OPEN) => CloseAndOpen(queueName, timeout)
+      case Seq(ABORT)      => Abort(queueName, timeout)
+      case Seq(PEEK)       => Peek(queueName, timeout)
+      case _               => throw new NonexistentCommand(tokens.map { case Buf.Utf8(s) => s }.mkString)
     }
   }
 }
